@@ -1,0 +1,12 @@
+source: aflow         # sdss | aflow
+shards: 3             # SDSS plates / AFLUX pages (null = all)
+seed: 42
+n_components: 50
+max_fit_rows: 20000
+namespace: ema5937-tabular   # irohds ns
+
+sdss:
+  run2d: v5_13_2
+  loglam: [3.58, 3.96]
+aflow:
+  catalogs: [icsd]

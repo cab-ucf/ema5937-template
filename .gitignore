@@ -1,0 +1,10 @@
+hpc/hpc.yaml
+hpc/job.slurm
+.venv/
+.cache/
+__pycache__/
+data/
+figures/
+results/
+report/main.pdf
+slurm-*.out

@@ -1,0 +1,11 @@
+# Use `cp hpc/hpc.yaml.example hpc/hpc.yaml` and edit the `hpc/hpc.yaml` (`hpc/hpc.yaml` is GITIGNORED).
+# Use SSH keys to connect
+host: stokes.ist.ucf.edu
+user: your_nid
+remote_dir: /home/your_nid/ema5937-tabular
+partition: normal
+time: "12:00:00"
+cpus: 16
+mem: 128G              # adjust to what is needed - the full SDSS matrix (4M x 3800) may only need a little bit of RAM
+email: your_nid@ucf.edu
+config: config.hpc.yaml

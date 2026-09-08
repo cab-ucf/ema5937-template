@@ -1,0 +1,9 @@
+.git
+.venv
+.cache
+data
+figures
+results
+__pycache__
+report/main.pdf
+hpc/hpc.yaml

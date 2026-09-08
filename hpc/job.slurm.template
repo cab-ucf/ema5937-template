@@ -1,0 +1,18 @@
+#!/bin/bash
+#SBATCH --job-name=template5937
+#SBATCH --partition={{partition}}
+#SBATCH --time={{time}}
+#SBATCH --cpus-per-task={{cpus}}
+#SBATCH --mem={{mem}}
+#SBATCH --mail-user={{email}}
+#SBATCH --mail-type=END,FAIL
+#SBATCH --output=slurm-%j.out
+set -euo pipefail
+cd {{remote_dir}}
+podman run --rm -v .:/work -w /work $(podman build -q .) make all CONFIG={{config}}
+
+
+# command -v cargo >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal  # irohds daemon build
+# export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH" OMP_NUM_THREADS={{cpus}}
+# command -v uv    >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+# make all CONFIG={{config}}

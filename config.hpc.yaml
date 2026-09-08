@@ -1,0 +1,12 @@
+source: sdss                 # sdss | aflow
+shards: null
+seed: 42
+n_components: 50             # PCA components
+max_fit_rows: 100000         # max for SVMs O(n^2) 
+namespace: ema5937-tabular   # irohds ns
+
+sdss:
+  run2d: v5_13_2
+  loglam: [3.58, 3.96]       # log10(Angstrom)
+aflow:
+  catalogs: [icsd, lib1, lib2, lib3]
