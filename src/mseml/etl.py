@@ -1,57 +1,41 @@
-"""Fetch shards politely, once, into one parquet schema; share them over irohds.
+"""Fetch SDSS plates politely, once; share them over irohds; load into DuckDB.
 
-    id | label | target | f0 .. fN        (features are float32)
+    plate | spectrum | line | line_fit        (see schema.sql)
 
-SDSS  [sdss_dr17]: label = CLASS, target = redshift,
-                   features = flux on a fixed log-wavelength grid.
-AFLOW [aflow2022, rose2017aflux]: one page per iroh doc. label = Egap_type,
-                   target = formation enthalpy/atom, features = element fractions + cell scalars.
+SDSS [sdss_dr17]: one plate = up to 1000 spectra, each with the pipeline's
+class (STAR/GALAXY/QSO) and redshift z. Flux is cut to a fixed log-wavelength window.
+Balmer lines [nist_asd]: rest wavelengths from the Rydberg formula (theory) and
+the lab (NIST), plus where each line is found in every galaxy spectrum (extraction).
 
-    uv run python -m mseml.etl config.yaml data/dataset.parquet
+    uv run python -m mseml.etl config.yaml data/dataset.db
 
-Each shard function is decorated with `@irohds.memo(ns=NS)`: the first machine
-to compute a shard stores it and announces it; every other machine in the
+Each plate function is decorated with `@irohds.memo(ns=NS)`: the first machine
+to compute a plate stores it and announces it; every other machine in the
 namespace downloads it instead.  Set MSEML_NS to change the namespace.
 """
 
 import itertools
-import json
 import os
 import sys
 import time
 from pathlib import Path
 
+import duckdb
 import irohds
 import numpy as np
 import pandas as pd
-import requests
 import yaml
 from astropy.io import fits
-from mendeleev import element
+from scipy.constants import Rydberg, m_e, m_p
 
 NS = os.environ.get("MSEML_NS", "mseml")
 PAUSE = 1.0  # seconds between remote requests: one slow client, never parallel
 SDSS = "https://data.sdss.org/sas/dr17/eboss/spectro/redux"
-AFLUX = "https://aflow.org/API/aflux/?"
-AFLOW_KEYS = ("auid,species,stoichiometry,nspecies,natoms,enthalpy_formation_atom,"
-              "Egap_type,spacegroup_relax,density,volume_atom,spin_atom")
-AFLOW_SCALARS = ["nspecies", "natoms", "spacegroup_relax", "density", "volume_atom", "spin_atom"]
-ELEMENTS = [e.symbol for e in element(list(range(1, 95)))]
+# Balmer lines: upper level n, lab (NIST) vacuum wavelength in Angstrom
+BALMER = {"Halpha": (3, 6564.61), "Hbeta": (4, 4862.68), "Hgamma": (5, 4341.68)}
 
 
 # --- transport -----------------------------------------------------------------
-
-def get(url: str) -> bytes:
-    """Paced GET with exponential backoff on transient errors."""
-    for attempt in range(6):
-        time.sleep(PAUSE * 2**attempt)
-        r = requests.get(url, timeout=120)
-        if r.ok:
-            return r.content
-        if r.status_code not in (429, 500, 502, 503, 504):
-            r.raise_for_status()
-    raise RuntimeError(f"gave up: {url}")
-
 
 def open_fits(url: str) -> fits.HDUList:
     """Lazy FITS over HTTP range requests: only the HDUs we touch are transferred."""
@@ -59,11 +43,8 @@ def open_fits(url: str) -> fits.HDUList:
     return fits.open(url, use_fsspec=True)
 
 
-def save(rel: str, ids, labels, targets, X) -> irohds.FileRef:
-    """Write one shard as zstd parquet inside the irohds data dir; return its FileRef."""
-    X = np.asarray(X, np.float32)
-    df = pd.DataFrame({"id": ids, "label": labels, "target": targets})
-    df[[f"f{i}" for i in range(X.shape[1])]] = X
+def save(rel: str, df: pd.DataFrame) -> irohds.FileRef:
+    """Write one plate as zstd parquet inside the irohds data dir; return its FileRef."""
     path = Path(irohds.resolve(rel))
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path, compression="zstd", index=False)
@@ -73,7 +54,7 @@ def save(rel: str, ids, labels, targets, X) -> irohds.FileRef:
 # --- memoization --------------------------------------------------
 
 @irohds.memo(ns=NS)
-def sdss_plates(run2d: str) -> list[tuple[int, int]]:
+def good_plates(run2d: str) -> list[tuple[int, int]]:
     with open_fits(f"{SDSS}/{run2d}/platelist.fits") as h:
         t = h[1].data
     good = np.char.strip(t["PLATEQUALITY"].astype(str)) == "good"
@@ -81,7 +62,7 @@ def sdss_plates(run2d: str) -> list[tuple[int, int]]:
 
 
 @irohds.memo(ns=NS)
-def sdss_shard(plate: int, mjd: int, run2d: str, lo: float, hi: float) -> irohds.FileRef:
+def plate_spectra(plate: int, mjd: int, run2d: str, lo: float, hi: float) -> irohds.FileRef:
     base = f"{SDSS}/{run2d}/{plate}"
     with open_fits(f"{base}/spPlate-{plate}-{mjd}.fits") as h:
         c0, c1 = h[0].header["COEFF0"], h[0].header["COEFF1"]  # log10(lambda) = c0 + c1 * pixel
@@ -90,51 +71,61 @@ def sdss_shard(plate: int, mjd: int, run2d: str, lo: float, hi: float) -> irohds
     with open_fits(f"{base}/{run2d}/spZbest-{plate}-{mjd}.fits") as h:
         z = h[1].data
     ok = (z["ZWARNING"] == 0) & np.isfinite(flux).all(axis=1)
-    ids = [f"{plate}-{mjd}-{f}" for f in z["FIBERID"][ok]]
-    labels = np.char.strip(z["CLASS"][ok].astype(str))
-    return save(f"sdss/{run2d}/{plate}-{mjd}.parquet", ids, labels, z["Z"][ok].astype(float), flux[ok])
+    return save(f"data/sdss/{run2d}/{plate}-{mjd}.parquet", pd.DataFrame({
+        "plate": plate, "mjd": mjd, "fiber": z["FIBERID"][ok].astype(int),
+        "class": np.char.strip(z["CLASS"][ok].astype(str)), "z": z["Z"][ok].astype(float),
+        "loglam0": c0 + c1 * i0, "dloglam": c1, "flux": list(flux[ok].astype(np.float32))}))
 
 
-@irohds.memo(ns=NS)
-def aflow_shard(catalogs: tuple, page: int) -> irohds.FileRef | None:
-    """AFLUX page of 1000 entries, sorted by auid (stable); None once exhausted."""
-    rows = json.loads(get(f"{AFLUX}catalog({':'.join(catalogs)}),{AFLOW_KEYS},$paging({page},1000)"))
-    if not rows:
-        return None
-    d = pd.DataFrame(rows).dropna(subset=["enthalpy_formation_atom", "Egap_type"])
-    comp = np.zeros((len(d), len(ELEMENTS)), np.float32)
-    for i, (species, fracs) in enumerate(zip(d["species"], d["stoichiometry"])):
-        comp[i, [ELEMENTS.index(s) for s in species]] = fracs
-    X = np.hstack([comp, d[AFLOW_SCALARS].to_numpy(np.float32)])
-    labels = d["Egap_type"].str.replace("_spin-polarized", "").tolist()
-    return save(f"aflow/{'-'.join(catalogs)}/page{page:05d}.parquet",
-                d["auid"].tolist(), labels, d["enthalpy_formation_atom"].astype(float).tolist(), X)
+# --- theory & extraction -------------------------------------------------------
+
+def balmer() -> list[tuple]:
+    """Rydberg formula with hydrogen's reduced mass: 1/lambda = R_H (1/2^2 - 1/n^2)."""
+    R_H = Rydberg / (1 + m_e / m_p)  # CODATA constants from scipy, in 1/m
+    return [(k, n, 1e10 / (R_H * (1 / 4 - 1 / n**2)), lab) for k, (n, lab) in BALMER.items()]
+
+
+def fit_lines(d: pd.DataFrame) -> list[tuple]:
+    """Find each Balmer line near where the pipeline z puts it; keep 5-sigma detections."""
+    rows = []
+    for r in d[d["class"] == "GALAXY"].itertuples():
+        lam = 10 ** (r.loglam0 + r.dloglam * np.arange(len(r.flux)))
+        for name, (_, rest) in BALMER.items():
+            dist = abs(lam - rest * (1 + r.z))           # Angstrom from the expected spot
+            near, side = dist < 8, (dist > 20) & (dist < 60)
+            if near.sum() < 5 or side.sum() < 20:
+                continue                                 # line falls outside the spectrum
+            excess = r.flux[near] - np.median(r.flux[side])  # line above the continuum
+            if excess.max() < 5 * r.flux[side].std():
+                continue                                 # too weak to measure
+            w = np.clip(excess, 0, None)
+            obs = (lam[near] * w).sum() / w.sum()        # flux-weighted centroid
+            rows.append((r.plate, r.mjd, r.fiber, name, obs, obs / rest - 1))
+    return rows
 
 
 # --- driver --------------------------------------------------------------------
 
-def shards(cfg: dict):
-    """Yield FileRefs for the configured source until exhausted."""
-    if cfg["source"] == "sdss":
-        s = cfg["sdss"]
-        for plate, mjd in sdss_plates(s["run2d"]):
-            yield sdss_shard(plate, mjd, s["run2d"], *s["loglam"])
-    else:
-        catalogs = tuple(cfg["aflow"]["catalogs"])
-        for page in itertools.count(1):
-            ref = aflow_shard(catalogs, page)
-            if ref is None:
-                return
-            yield ref
-
-
 def main(config: str, out: str) -> None:
     cfg = yaml.safe_load(open(config))
-    refs = itertools.islice(shards(cfg), cfg.get("shards"))  # None = no cap
-    df = pd.concat([pd.read_parquet(r.path) for r in refs], ignore_index=True)
+    s = cfg["sdss"]
+    plates = itertools.islice(good_plates(s["run2d"]), cfg.get("plates"))  # None = all
+    paths = [plate_spectra(p, m, s["run2d"], *s["loglam"]).path for p, m in plates]
+
     Path(out).parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(out, compression="zstd", index=False)
-    print(f"[etl] {cfg['source']}: {len(df)} rows x {df.shape[1] - 3} features -> {out}")
+    Path(out).unlink(missing_ok=True)  # rebuild from scratch: same inputs -> same database
+    db = duckdb.connect(out)
+    db.execute(Path("schema.sql").read_text())
+    q = f"FROM read_parquet({[str(p) for p in paths]})"
+    db.execute(f"INSERT INTO plate SELECT DISTINCT plate, mjd, loglam0, dloglam {q} ORDER BY ALL")
+    db.execute(f"INSERT INTO spectrum SELECT plate, mjd, fiber, class, z, flux {q} "
+               "ORDER BY plate, mjd, fiber")
+    db.executemany("INSERT INTO line VALUES (?, ?, ?, ?)", balmer())
+    found = pd.DataFrame([f for p in paths for f in fit_lines(pd.read_parquet(p))],
+                         columns=["plate", "mjd", "fiber", "line", "lambda_obs", "z_line"])
+    db.execute("INSERT INTO line_fit SELECT * FROM found ORDER BY ALL")  # DuckDB reads `found`
+    n = db.sql("SELECT (FROM spectrum SELECT count(*)), (FROM line_fit SELECT count(*))").fetchone()
+    print(f"[etl] {len(paths)} plates: {n[0]} spectra, {n[1]} line fits -> {out}")
 
 
 if __name__ == "__main__":

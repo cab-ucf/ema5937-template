@@ -7,8 +7,9 @@ just  →  podman  →  make  →  uv run mseml.etl → mseml.analysis  →  typ
 | File | Description |
 |------|------|
 | `Makefile`              | orchestrates report & analysis |
-| `src/mseml/etl.py`      | Downloads data (slowly - no ddos), writes parquets (zstd), shares over irohds, concatenates into `data/dataset.parquet` |
-| `src/mseml/analysis.py` | PCA, LDA, SVC, MLP -> `figures/*.png` & `results/results.json` |
+| `schema.sql`            | The database: `plate`, `spectrum`, `line`, `line_fit` tables |
+| `src/mseml/etl.py`      | Downloads SDSS plates (slowly - no ddos), writes parquets (zstd), shares over irohds, loads `data/dataset.db` |
+| `src/mseml/analysis.py` | PCA, LDA, SVC, MLP, Balmer lines -> `figures/*.png` & `results/results.json` |
 | `report/main.typ`       | Idempotent Typst pdf |
 
 ```bash
@@ -19,17 +20,20 @@ make all CONFIG=config.hpc.yaml   # pulls all data (`just hpc` also submits this
 
 ## Data
 
-`config.yaml` picks one of two sources (sdss or aflow).
-Both make same `id | label | target | f0..fN` schema.
+SDSS eBOSS optical spectra: one plate holds up to 1000 spectra, each labelled
+STAR/GALAXY/QSO with a redshift by the SDSS pipeline.
 
-| source  | rows * features | label, target |
-|---------|-----------------|----------------|
-| `sdss`  | ~4 million  spectra * 3800 pixels | STAR/GALAXY/QSO, redshift |
-| `aflow` | ~60,000 ICSD | `Egap_type`, formation enthalpy/atom |
+| table      | one row per | holds |
+|------------|-------------|-------|
+| `plate`    | plate       | wavelength grid of its spectra |
+| `spectrum` | spectrum    | class, redshift, flux (3800 pixels) |
+| `line`     | Balmer line | rest wavelength: Rydberg formula (theory) and NIST (lab) |
+| `line_fit` | line found in a galaxy | observed wavelength and the redshift it implies |
 
-`shards: 3` locally, `null` (all) in `config.hpc.yaml`. No API keys. Each shard
-is fetched once by whoever asks first and thereafter served peer-to-peer within
-the irohds `namespace`, so the origin sees a single crawl.
+`plates: 16` (~60 MB, ~1000 spectra each, ~1 GB total) locally, `null` (all) in
+`config.hpc.yaml`. No API keys. Each plate is fetched once by whoever asks first
+and thereafter served peer-to-peer within the irohds namespace (`MSEML_NS`), so
+the origin sees a single crawl.
 
 ## Report
 
@@ -40,4 +44,4 @@ the irohds `namespace`, so the origin sees a single crawl.
 - irohds ships wheels for macOS/aarch64 Linux; on x86_64 Linux `uv sync` compiles
   its Rust daemon (the Containerfile and Slurm template install rustup).
 - The full SDSS matrix is large (~80 GB parquet, 4M * 3800 float32). Use a
-  large-memory node, or bin pixels in `sdss_shard`.
+  large-memory node, or bin pixels in `plate_spectra`.

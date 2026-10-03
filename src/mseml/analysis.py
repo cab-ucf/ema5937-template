@@ -1,15 +1,17 @@
-"""dataset.parquet -> SVD, PCA, LDA, SVM, MLP -> one figure each + results.json for the report.
+"""dataset.db -> SVD, PCA, LDA, SVM, MLP, Balmer lines -> one figure each + results.json.
 
 SVD/PCA reduce the wide matrix to k components once; LDA, SVM and the MLP are fit on
 those k components (dimensionality reduction as preprocessing). [pedregosa2011sklearn]
 
 Usage:
-    uv run python -m mseml.analysis config.yaml data/dataset.parquet figures results/results.json
+    uv run python -m mseml.analysis config.yaml data/dataset.db figures results/results.json
 """
 
 import json
 import sys
 import yaml
+import duckdb
+from scipy.constants import c
 from datetime import UTC, datetime
 from pathlib import Path
 import numpy as np
@@ -56,14 +58,15 @@ def main(config: str, data: str, figdir: str, out: str) -> None:
     figs.mkdir(parents=True, exist_ok=True)
 
     # ---- load & standardize ---------------------------------------------------------------
-    df = pd.read_parquet(data)
-    X = df.filter(regex=r"^f\d+$").to_numpy(np.float32)
-    if cfg["source"] == "sdss":  # spectra: divide each by its median flux first
-        med = np.median(X, axis=1, keepdims=True)
-        keep = med[:, 0] > 0
-        df, X = df[keep].reset_index(drop=True), X[keep] / med[keep]
-    y = df["label"].to_numpy()
-    t = df["target"].to_numpy()
+    db = duckdb.connect(data, read_only=True)
+    df = db.sql("SELECT class, z, flux FROM spectrum ORDER BY plate, mjd, fiber").df()
+    X = np.vstack(df["flux"]).astype(np.float32)  # one row per spectrum
+    # spectra: divide each by its median flux first
+    med = np.median(X, axis=1, keepdims=True)
+    keep = med[:, 0] > 0
+    df, X = df[keep].reset_index(drop=True), X[keep] / med[keep]
+    y = df["class"].to_numpy()
+    t = df["z"].to_numpy()
     Xs = StandardScaler().fit_transform(X)
     print(f"[analysis] {Xs.shape[0]} rows x {Xs.shape[1]} features, classes {sorted(set(y))}")
 
@@ -109,27 +112,51 @@ def main(config: str, data: str, figdir: str, out: str) -> None:
 
     # ---- MLP: same two tasks with a small neural network [prince2023udl] -------------------
     kw = dict(hidden_layer_sizes=(128, 64), early_stopping=True, max_iter=300, random_state=seed)
-    clf = MLPClassifier(**kw).fit(Ztr, ytr)
+    cls = np.unique(y)  # integer labels: sklearn>=1.7 early_stopping chokes on strings
+    clf = MLPClassifier(**kw).fit(Ztr, np.searchsorted(cls, ytr))
     reg = MLPRegressor(**kw).fit(Ztr, ttr)
-    mlp_acc, mlp_pred = accuracy_score(yte, clf.predict(Zte)), reg.predict(Zte)
+    mlp_acc, mlp_pred = accuracy_score(yte, cls[clf.predict(Zte)]), reg.predict(Zte)
     fig, ax = plt.subplots(1, 2, figsize=(8.5, 3.6))
     ax[0].plot(clf.loss_curve_)
     ax[0].set(xlabel="epoch", ylabel="training loss", title=f"MLP classifier, accuracy {mlp_acc:.3f}")
     parity(ax[1], tte, mlp_pred, f"MLP regressor, MAE {mean_absolute_error(tte, mlp_pred):.3g}")
     fig.savefig(figs / "mlp.png")
 
+    # ---- Balmer lines: Rydberg (theory) vs NIST (lab) vs galaxy spectra (extraction) -------
+    km_s = c / 1e3
+    lines = db.sql("FROM line ORDER BY n_upper").df()
+    fit = db.sql(f"""SELECT line, s.z, z_line, {km_s} * (z_line - s.z) / (1 + s.z) AS dv
+                     FROM line_fit JOIN spectrum s USING (plate, mjd, fiber)""").df()
+    fig, ax = plt.subplots(1, 2, figsize=(8.5, 3.6))
+    for name in lines["name"]:
+        g = fit[fit["line"] == name]
+        ax[0].scatter(g["z"], g["z_line"], s=4, rasterized=True, label=f"{name} ({len(g)})")
+        ax[1].hist(g["dv"], bins=np.linspace(-150, 150, 61), histtype="step", label=name)
+    ax[0].set(xlabel="pipeline z", ylabel="z from one line", title="Redshift: pipeline vs line")
+    ax[1].set(xlabel="line minus pipeline (km/s)", ylabel="galaxies", title="Velocity offset")
+    ax[0].legend(markerscale=3, fontsize=8)
+    fig.savefig(figs / "lines.png")
+    dv = fit.groupby("line")["dv"]
+    med_dv, n_dv = dv.median(), dv.size()
+    mad_dv = dv.apply(lambda v: (v - v.median()).abs().median())  # robust spread
+
     # ---- numbers for the report -----------------------------------------------------------
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     Path(out).write_text(json.dumps({
         "generated_utc": datetime.now(UTC).isoformat(timespec="seconds"),
         "config": cfg,
-        "dataset": {"source": cfg["source"], "n_rows": len(df), "n_features": int(X.shape[1]),
+        "dataset": {"n_rows": len(df), "n_features": int(X.shape[1]),
                     "n_train": len(Ztr), "n_test": len(Zte), "classes": {c: int(n) for c, n in zip(*np.unique(y, return_counts=True))}},
         "svd": {"recon_error_at_k": float(recon[-1])},
         "pca": {"explained_2": float(ratio[:2].sum()), "explained_k": float(ratio.sum())},
         "lda": {"acc": lda_acc},
         "svm": {"acc": svc_acc, "mae": mean_absolute_error(tte, svr_pred), "r2": r2_score(tte, svr_pred)},
         "mlp": {"acc": mlp_acc, "mae": mean_absolute_error(tte, mlp_pred), "r2": r2_score(tte, mlp_pred)},
+        "lines": [{"name": l.name, "n_upper": int(l.n_upper), "rydberg": l.lambda_rydberg,
+                   "nist": l.lambda_nist,
+                   "dv_theory": km_s * (l.lambda_rydberg / l.lambda_nist - 1),
+                   "n": int(n_dv.get(l.name, 0)), "dv_median": med_dv.get(l.name),
+                   "dv_mad": mad_dv.get(l.name)} for l in lines.itertuples()],
     }, indent=2))
     print(f"[analysis] -> {figdir}/ and {out}")
 
